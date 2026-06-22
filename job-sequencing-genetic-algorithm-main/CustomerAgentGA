@@ -1,0 +1,213 @@
+    import os
+    import numpy as np
+    import random
+    from pathlib import Path
+    from ga_functions import (
+        calculate_average_completion_time,
+        create_next_generation,
+        crossover,
+        dynamic_optimizer,
+        evaluate_fitness,
+        get_best_solution,
+        heavy_local_search,
+        initialize_population,
+        insertion_mutation,
+        inversion_mutation,
+        load_customers,
+        micro_local_search,
+        proportional_selection,
+        precompute_delays,
+        tournament_selection,
+        three_way_tournament,
+        two_way_tournament,
+    )
+
+    script_path = Path(__file__).resolve()
+    script_dir = script_path.parent
+    DATA_DIR = script_dir / "data"
+
+
+    class CustomerAgentGA:
+        """
+        Genetic Algorithm for Just-In-Sequence Scheduling Problem (JISSP)  
+
+        Problem: Schedule jobs on machines to minimize total delay, where delay is the difference between the time a job is scheduled 
+        and its due time.
+
+        Encoding: Each solution is represented as a permutation of job indices, indicating the order in which jobs are scheduled.
+
+        Fitness: The fitness of a solution is calculated based on the total delay of the scheduled jobs. The goal is to minimize this delay.
+        """
+
+        def __init__(self, data_dir=DATA_DIR, base_mutation_rate=0.1, max_mutation_rate=0.8,
+                    dynamic_mutation=False, extinction_interval=0):
+            print("Initializing CustomerAgentGA...")
+
+            if not os.path.exists(data_dir):
+                raise FileNotFoundError(f"Data directory '{data_dir}' not found.")
+                
+            self.data_dir = data_dir
+            self.jobs, self.machines, self.customers, self.timeMatrix = load_customers(self.data_dir)   
+            print(f"Loaded {self.jobs} jobs and {self.machines} machines.")
+
+            self.delayMatrix, self.total_processing_time = precompute_delays(self.timeMatrix)
+            # store preferred defaults for GeneticAlgorithm
+            self.base_mutation_rate = base_mutation_rate
+            self.max_mutation_rate = max_mutation_rate
+            self.dynamic_mutation = dynamic_mutation
+            self.extinction_interval = extinction_interval
+
+        def GeneticAlgorithm(self, population_size=100, generations=500,
+                            base_mutation_rate=None, max_mutation_rate=None,
+                            elitism=True, verbose=True,
+                            dynamic_mutation=None, extinction_interval=None):
+            """
+            Main GA loop.
+    
+            Overview of one generation:
+                1. Evaluate fitness of every individual (= -makespan).
+                2. (Optional) Carry the best individual unchanged into the next
+                generation — this is called "elitism" and prevents the best
+                solution from being lost.
+                3. Select parents using tournament selection.
+                4. Produce offspring via OX crossover + swap mutation.
+                5. Replace the population with the offspring (+ elite).
+                6. Track and print the best makespan each generation.
+    
+            Args:
+                population_size (int)  : number of individuals in the population
+                generations     (int)  : number of GA iterations
+                mutation_rate   (float): probability of mutation [0.0, 1.0]
+                elitism         (bool) : if True, best individual survives each gen
+                verbose         (bool) : if True, print progress every 50 generations
+    
+            Returns:
+                best_sequence (np.ndarray): best job ordering found
+                best_makespan (int)       : its makespan (lower = better)
+            """
+            # Use instance defaults if not explicitly provided
+            if base_mutation_rate is None:
+                base_mutation_rate = self.base_mutation_rate
+            if max_mutation_rate is None:
+                max_mutation_rate = self.max_mutation_rate
+            if dynamic_mutation is None:
+                dynamic_mutation = self.dynamic_mutation
+            if extinction_interval is None:
+                extinction_interval = self.extinction_interval
+
+            # Step 1: Create initial random population
+            population = initialize_population(self.jobs, population_size)
+    
+            best_sequence = None
+            best_makespan = float("inf")
+            stagnation_counter = 0
+            current_mutation_rate = base_mutation_rate
+    
+            for generation in range(generations):
+    
+                # Step 2: Evaluate fitness for all individuals
+                fitness_scores = evaluate_fitness(population, self.delayMatrix, self.total_processing_time)
+
+                # Step 3: Check if we found a new best solution. If so, reset the stagnation counter.
+    
+                gen_best, gen_makespan = get_best_solution(population, fitness_scores, self.delayMatrix, self.total_processing_time)
+                
+                if gen_makespan < best_makespan:
+                    best_makespan = gen_makespan
+                    best_sequence = gen_best.copy()
+                    stagnation_counter = 0  
+                else:
+                    stagnation_counter += 1
+
+                if generation > 0 and generation % 100 == 0:
+                    polished_best, polished_makespan = micro_local_search(best_sequence, 10, self.delayMatrix, self.total_processing_time)
+                    
+                    if polished_makespan < best_makespan:
+                        # Lamarckian: Inject it into the population so it can breed!
+                        worst_idx = np.argmin(fitness_scores) # Overwrite the weakest individual
+                        population[worst_idx] = polished_best
+                        fitness_scores[worst_idx] = -polished_makespan
+                        
+                        best_makespan = polished_makespan
+                        best_sequence = polished_best.copy()
+
+                # Update the mutation rate for this generation based on the counter
+                if dynamic_mutation:
+                    current_mutation_rate = dynamic_optimizer(
+                        stagnation_counter, current_mutation_rate, base_mutation_rate, max_mutation_rate
+                    )
+
+                # --- NEW: MASS EXTINCTION EVENT ---
+                # If we are stuck for 60 generations, wipe the slate clean.
+                # Extinction event based on fixed interval (if enabled)
+                if extinction_interval and extinction_interval > 0 and (generation > 0 and generation % extinction_interval == 0):
+                    if verbose:
+                        print(f"  *** EXTINCTION EVENT AT GEN {generation} - reinitializing population (keeping elites) ***")
+
+                    # keep top 10% elites (at least 1)
+                    elite_count = max(1, population_size // 10)
+                    sorted_idx = sorted(range(len(fitness_scores)), key=lambda i: fitness_scores[i], reverse=True)
+                    elites = [population[i].copy() for i in sorted_idx[:elite_count]]
+
+                    # reinitialize the rest
+                    new_pop = elites.copy()
+                    new_pop += initialize_population(self.jobs, population_size - len(new_pop))
+                    population = new_pop
+                    fitness_scores = evaluate_fitness(population, self.delayMatrix, self.total_processing_time)
+                    stagnation_counter = 0
+                    current_mutation_rate = base_mutation_rate
+
+                if verbose and (generation % 50 == 0 or generation == generations - 1):
+                    print(f"  Gen {generation:4d} | Best Avg Time: {best_makespan:.3f} | Mut Rate: {current_mutation_rate:.2f} | Best Time : {best_makespan*self.jobs}" )
+
+                selected_parents = []
+
+                for _ in range(population_size):
+                    parent = tournament_selection(population, fitness_scores, tournament_size=4)
+                    selected_parents.append(parent)
+    
+                # Step 5: Build next generation via crossover + mutation
+                next_generation = create_next_generation(selected_parents, population_size, current_mutation_rate)
+    
+                # Step 6 (optional): Elitism — inject the current best into next gen
+                if elitism:
+                    # Replace a random individual with the all-time best
+                    replace_idx = random.randint(0, population_size - 1)
+                    next_generation[replace_idx] = best_sequence.copy()
+    
+                population = next_generation
+
+            # ==========================================
+            # PHASE 2: POST-OPTIMIZATION
+            # ==========================================
+
+            print(f"\nGenerations complete. Memetic GA Best Avg Time: {best_makespan:.3f}")
+            print("Initiating Final Heavy Local Search Polish (This will take a moment)...")
+            
+            final_sequence, final_makespan = heavy_local_search(best_sequence, self.delayMatrix, self.total_processing_time)
+            
+            print(f"\nFinished. Final Post-Optimized Avg Time: {final_makespan:.3f}")
+            print(f"Optimal job sequence: {final_sequence}")
+    
+            return final_sequence, final_makespan
+
+
+    # =============================================================================
+    # ENTRY POINT
+    # =============================================================================
+    
+    if __name__ == "__main__":
+        ga = CustomerAgentGA(data_dir=DATA_DIR)
+    
+        best_seq, best_ms = ga.GeneticAlgorithm(
+            population_size=200,
+            generations=15000,
+            base_mutation_rate=0.3,
+            max_mutation_rate=0.95,
+            elitism=True,
+            verbose=True,
+        )
+    
+        print("\n--- Result ---")
+        print(f"Optimal job sequence: {best_seq}")
+        print(f"Makespan (total time): {best_ms} Average completion time: {best_ms*ga.jobs}")
